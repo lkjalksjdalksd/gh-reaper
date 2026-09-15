@@ -140,29 +140,40 @@ if [ "${1:-}" = -C ] && [ "${3:-}" = rev-parse ] \
    && [ "${4:-}" = --is-inside-work-tree ]; then
     case "${2:-}" in
         "$CONCURRENCY_ROOT"/wt-*)
-            : > "$CONCURRENCY_SYNC/worker.$$"
-            attempts=0
-            while [ "$(find "$CONCURRENCY_SYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')" -lt 4 ] \
-                  && [ "$attempts" -lt 50 ]; do
-                sleep 0.1
-                attempts=$((attempts + 1))
-            done
-            if [ "$(find "$CONCURRENCY_SYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')" -lt 4 ]; then
-                : > "$CONCURRENCY_SYNC/timed-out"
-            fi
+            # One token per inspect worker. Serial git calls share one PPID;
+            # independently scheduled worktrees reach the four-party barrier.
+            : > "$CONCURRENCY_SYNC/worker.$PPID"
+            while [ ! -e "$CONCURRENCY_SYNC/go" ]; do sleep 0.1; done
             ;;
     esac
 fi
 exec "$REAL_GIT" "$@"
 EOF
     chmod +x "$CBIN/git"
+    (
+        sleep 30
+        : > "$CSYNC/timed-out"
+        : > "$CSYNC/go"
+    ) &
+    watchdog=$!
     PATH="$CBIN:$PATH" REAL_GIT="$REAL_GIT" CONCURRENCY_SYNC="$CSYNC" \
-        CONCURRENCY_ROOT="$SBX" "$REAPER" --json --jobs 4 --path "$SBX" >/dev/null 2>&1
+        CONCURRENCY_ROOT="$SBX" "$REAPER" --json --jobs 4 --path "$SBX" >/dev/null 2>&1 &
+    scan_pid=$!
+    while [ "$(find "$CSYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')" -lt 4 ] \
+          && [ ! -e "$CSYNC/timed-out" ] && kill -0 "$scan_pid" 2>/dev/null; do
+        sleep 0.1
+    done
     workers="$(find "$CSYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')"
-    if [ "$workers" -ge 4 ] && [ ! -e "$CSYNC/timed-out" ]; then
+    [ "$workers" -ge 4 ] && : > "$CSYNC/go"
+    scan_rc=0
+    wait "$scan_pid" || scan_rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    if [ "$workers" -ge 4 ] && [ ! -e "$CSYNC/timed-out" ] && [ "$scan_rc" -eq 0 ]; then
         ok "--jobs schedules one worktree per worker"
     else
-        no "--jobs schedules one worktree per worker" "concurrent workers=$workers"
+        no "--jobs schedules one worktree per worker" \
+            "concurrent workers=$workers timed_out=$([ -e "$CSYNC/timed-out" ] && echo y || echo n) exit=$scan_rc"
     fi
     rm -rf "$CBIN" "$CSYNC"
 
