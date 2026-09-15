@@ -3,6 +3,15 @@
 All notable changes to `gh-reaper` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **`--jobs` now provides the requested worktree-level concurrency.** Parallel
+  inspection previously handed up to 16 worktrees to each worker, serializing
+  them inside that process and under-filling the worker pool on normal-sized
+  fleets. Every worktree is now an independent task, so slow filesystem or Git
+  metadata calls no longer pin an entire batch behind one worker.
+
 ## [1.8.0] - 2026-08-19
 
 ### Added

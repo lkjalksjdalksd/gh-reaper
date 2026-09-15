@@ -131,6 +131,41 @@ else
         check; ok "JSON classification [jq missing, skipped]"
     fi
 
+    check  # --jobs must schedule individual worktrees, not multi-worktree serial batches
+    CBIN="$(mktemp -d)"; CSYNC="$(mktemp -d)"
+    REAL_GIT="$(command -v git)"
+    cat > "$CBIN/git" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = -C ] && [ "${3:-}" = rev-parse ] \
+   && [ "${4:-}" = --is-inside-work-tree ]; then
+    case "${2:-}" in
+        "$CONCURRENCY_ROOT"/wt-*)
+            : > "$CONCURRENCY_SYNC/worker.$$"
+            attempts=0
+            while [ "$(find "$CONCURRENCY_SYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')" -lt 4 ] \
+                  && [ "$attempts" -lt 50 ]; do
+                sleep 0.1
+                attempts=$((attempts + 1))
+            done
+            if [ "$(find "$CONCURRENCY_SYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')" -lt 4 ]; then
+                : > "$CONCURRENCY_SYNC/timed-out"
+            fi
+            ;;
+    esac
+fi
+exec "$REAL_GIT" "$@"
+EOF
+    chmod +x "$CBIN/git"
+    PATH="$CBIN:$PATH" REAL_GIT="$REAL_GIT" CONCURRENCY_SYNC="$CSYNC" \
+        CONCURRENCY_ROOT="$SBX" "$REAPER" --json --jobs 4 --path "$SBX" >/dev/null 2>&1
+    workers="$(find "$CSYNC" -name 'worker.*' -type f | wc -l | tr -d ' ')"
+    if [ "$workers" -ge 4 ] && [ ! -e "$CSYNC/timed-out" ]; then
+        ok "--jobs schedules one worktree per worker"
+    else
+        no "--jobs schedules one worktree per worker" "concurrent workers=$workers"
+    fi
+    rm -rf "$CBIN" "$CSYNC"
+
     check  # default is read-only
     "$REAPER" --no-color --path "$SBX" >/dev/null 2>&1
     if [ -d "$SBX/wt-clean" ] && [ -d "$SBX/wt-merged" ]; then

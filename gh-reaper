@@ -756,7 +756,7 @@ main() {
         printf '%s\0' "${markers[@]}" \
             | REAPER_OUT_DIR="$outdir" REAPER_CHECK_PRS="$opt_check_prs" \
               REAPER_IGNORE_LOCKS="$opt_ignore_locks" \
-              xargs -0 -P "$jobs" -n 16 "$SELF_PATH" --__inspect 2>/dev/null || true
+              xargs -0 -P "$jobs" -n 1 "$SELF_PATH" --__inspect 2>/dev/null || true
         while IFS= read -r rec_line; do
             [ -n "$rec_line" ] && RECORDS+=("$rec_line")
         done < <(cat "$outdir"/*.tsv 2>/dev/null)
