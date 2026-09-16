@@ -231,7 +231,7 @@ file_mtime() {
 # graph and pack traversal. for-each-ref applies the same reachability filter
 # but stops after the first match.
 remote_contains_head() {
-    local wt="$1" branch ref
+    local wt="$1" branch ref resolved
     local priority_refs=()
     branch="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 
@@ -256,11 +256,16 @@ remote_contains_head() {
     read -r -a priority_refs \
         <<< "${GH_REAPER_PRIORITY_REFS:-origin/HEAD origin/develop origin/main origin/master}"
     for ref in "${priority_refs[@]}"; do
-        if git -C "$wt" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1 \
-           && git -C "$wt" merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
-            printf '%s\n' "$ref"
-            return 0
-        fi
+        resolved="$(git -C "$wt" rev-parse --symbolic-full-name --verify "$ref" 2>/dev/null || true)"
+        case "$resolved" in
+            refs/remotes/*)
+                if git -C "$wt" rev-parse -q --verify "$resolved^{commit}" >/dev/null 2>&1 \
+                   && git -C "$wt" merge-base --is-ancestor HEAD "$resolved" 2>/dev/null; then
+                    printf '%s\n' "$resolved"
+                    return 0
+                fi
+                ;;
+        esac
     done
 
     # Preserve the original any-remote semantics for uncommon layouts, but
