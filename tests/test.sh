@@ -127,9 +127,78 @@ else
         only="$("$REAPER" --json --merged --path "$SBX" 2>/dev/null | jq -r '.[].branch' 2>/dev/null)"
         [ "$only" = "feat-merged" ] && ok "--merged filter narrows to merged" \
             || no "--merged filter narrows to merged" "got: $only"
+
+        check
+        local_priority="$(GH_REAPER_PRIORITY_REFS=HEAD "$REAPER" --json --path "$SBX" 2>/dev/null \
+            | jq -r '.[] | select(.branch == "feat-unpushed") | .status')"
+        [ "$local_priority" = "unpushed" ] \
+            && ok "local priority refs cannot suppress unpushed status" \
+            || no "local priority refs cannot suppress unpushed status" "got: $local_priority"
     else
         check; ok "JSON classification [jq missing, skipped]"
+        check; ok "local priority ref rejection [jq missing, skipped]"
     fi
+
+    # A differently named remote ref exercises both the configured priority
+    # fast path and the bounded any-remote fallback through the public CLI.
+    FAST_ROOT="$(dirname "$SBX")/containment"; mkdir -p "$FAST_ROOT"
+    (
+        cd "$FAST_ROOT" || exit 1
+        g init --bare remote.git >/dev/null
+        g init repo >/dev/null
+        cd repo || exit 1
+        g remote add origin "$FAST_ROOT/remote.git"
+        echo base > base.txt; g add base.txt; g commit -qm base
+        g push -q -u origin main
+        g worktree add -q ../wt-priority -b feat-priority
+        cd ../wt-priority || exit 1
+        echo priority > priority.txt; g add priority.txt; g commit -qm priority
+        g push -q origin HEAD:refs/heads/uncommon
+    ) >/dev/null 2>&1
+    FBIN="$(mktemp -d)"; FALLBACK_MARKER="$FBIN/fallback"
+    REAL_GIT="$(command -v git)"
+    cat > "$FBIN/git" <<'EOF'
+#!/bin/sh
+case " $* " in
+    *" for-each-ref --count=1 "*" --contains=HEAD refs/remotes "*)
+        : > "$FALLBACK_MARKER"
+        [ "${FAIL_FALLBACK:-0}" = 1 ] && exit 99
+        ;;
+esac
+exec "$REAL_GIT" "$@"
+EOF
+    chmod +x "$FBIN/git"
+
+    if command -v jq >/dev/null 2>&1; then
+        check
+        fast_status="$(PATH="$FBIN:$PATH" REAL_GIT="$REAL_GIT" FALLBACK_MARKER="$FALLBACK_MARKER" \
+            FAIL_FALLBACK=1 GH_REAPER_PRIORITY_REFS=origin/uncommon \
+            "$REAPER" --json --path "$FAST_ROOT" 2>/dev/null \
+            | jq -r '.[] | select(.branch == "feat-priority") | .status')"
+        if [ "$fast_status" = clean ] && [ ! -e "$FALLBACK_MARKER" ]; then
+            ok "configured remote priority ref bypasses exhaustive fallback"
+        else
+            no "configured remote priority ref bypasses exhaustive fallback" \
+                "status=$fast_status fallback=$([ -e "$FALLBACK_MARKER" ] && echo y || echo n)"
+        fi
+
+        check
+        rm -f "$FALLBACK_MARKER"
+        fallback_status="$(PATH="$FBIN:$PATH" REAL_GIT="$REAL_GIT" FALLBACK_MARKER="$FALLBACK_MARKER" \
+            GH_REAPER_PRIORITY_REFS=origin/main \
+            "$REAPER" --json --path "$FAST_ROOT" 2>/dev/null \
+            | jq -r '.[] | select(.branch == "feat-priority") | .status')"
+        if [ "$fallback_status" = clean ] && [ -e "$FALLBACK_MARKER" ]; then
+            ok "uncommon remote containment uses bounded fallback"
+        else
+            no "uncommon remote containment uses bounded fallback" \
+                "status=$fallback_status fallback=$([ -e "$FALLBACK_MARKER" ] && echo y || echo n)"
+        fi
+    else
+        check; ok "configured priority fast path [jq missing, skipped]"
+        check; ok "bounded containment fallback [jq missing, skipped]"
+    fi
+    rm -rf "$FBIN"
 
     check  # --jobs must schedule individual worktrees, not multi-worktree serial batches
     CBIN="$(mktemp -d)"; CSYNC="$(mktemp -d)"
