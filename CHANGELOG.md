@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Remote-containment checks short-circuit common matches.** Worktrees without
+  an upstream previously rendered every remote ref containing `HEAD`; large
+  repositories could reread multi-gigabyte packs for minutes per candidate.
+  Reaper now tests same-named and configured priority refs first, then bounds
+  the exhaustive fallback after its first match. `GH_REAPER_PRIORITY_REFS`
+  supplies repository-specific long-lived integration refs.
 - **`--jobs` now provides the requested worktree-level concurrency.** Parallel
   inspection previously handed up to 16 worktrees to each worker, serializing
   them inside that process and under-filling the worker pool on normal-sized

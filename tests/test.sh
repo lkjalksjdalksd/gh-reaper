@@ -37,6 +37,16 @@ check; grep -q "^set -euo pipefail" "$REAPER" && ok "strict mode" || no "strict 
 check; grep -q 'VERSION=' "$REAPER" && grep -q 'EXTENSION_NAME=' "$REAPER" && ok "metadata present" || no "metadata present" "missing VERSION/EXTENSION_NAME"
 
 check
+if grep -Fq 'for-each-ref --count=1' "$REAPER" \
+   && grep -Fq -- '--contains=HEAD refs/remotes' "$REAPER" \
+   && ! grep -Fq 'branch -r --contains HEAD' "$REAPER"; then
+    ok "remote containment short-circuits after the first match"
+else
+    no "remote containment short-circuits after the first match" \
+       "expected bounded for-each-ref lookup and no exhaustive branch scan"
+fi
+
+check
 if out="$("$REAPER" --version 2>&1)" && [[ "$out" == *"gh-reaper version"* ]]; then
     ok "--version"
 else

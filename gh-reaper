@@ -225,6 +225,50 @@ file_mtime() {
     fi
 }
 
+# Print the first remote-tracking ref that contains HEAD. `git branch -r
+# --contains` renders every match before the caller can test whether one exists;
+# repositories with thousands of remote refs can spend minutes doing needless
+# graph and pack traversal. for-each-ref applies the same reachability filter
+# but stops after the first match.
+remote_contains_head() {
+    local wt="$1" branch ref
+    local priority_refs=()
+    branch="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+    # Most unconfigured worktrees still have a same-named remote task ref.
+    # Test it directly before considering unrelated remote history.
+    if [ -n "$branch" ]; then
+        while IFS= read -r ref; do
+            case "$ref" in
+                refs/remotes/*/"$branch")
+                    if git -C "$wt" merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
+                        printf '%s\n' "$ref"
+                        return 0
+                    fi
+                    ;;
+            esac
+        done < <(git -C "$wt" for-each-ref --format='%(refname)' refs/remotes 2>/dev/null)
+    fi
+
+    # Try the small set of integration refs first. Repositories with another
+    # long-lived integration/control ref can prepend it through the
+    # whitespace-delimited GH_REAPER_PRIORITY_REFS environment variable.
+    read -r -a priority_refs \
+        <<< "${GH_REAPER_PRIORITY_REFS:-origin/HEAD origin/develop origin/main origin/master}"
+    for ref in "${priority_refs[@]}"; do
+        if git -C "$wt" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1 \
+           && git -C "$wt" merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
+            printf '%s\n' "$ref"
+            return 0
+        fi
+    done
+
+    # Preserve the original any-remote semantics for uncommon layouts, but
+    # bound output once the first containing ref is found.
+    git -C "$wt" for-each-ref --count=1 --format='%(refname)' \
+        --contains=HEAD refs/remotes 2>/dev/null
+}
+
 # Newest mtime (epoch seconds) among a worktree's tracked + untracked-but-not-
 # -ignored files. This deliberately excludes gitignored paths (node_modules,
 # dist, build output, caches) so that a routine install/build/checkout does not
@@ -585,7 +629,7 @@ inspect_marker() {
         if up="$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
             ahead="$(git -C "$wt" rev-list --count "${up}..HEAD" 2>/dev/null || echo 0)"
             [ "${ahead:-0}" -gt 0 ] && unpushed=1
-        elif [ -z "$(git -C "$wt" branch -r --contains HEAD 2>/dev/null)" ]; then
+        elif [ -z "$(remote_contains_head "$wt")" ]; then
             unpushed=1
         fi
 
