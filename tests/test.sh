@@ -169,29 +169,34 @@ exec "$REAL_GIT" "$@"
 EOF
     chmod +x "$FBIN/git"
 
-    check
-    fast_status="$(PATH="$FBIN:$PATH" REAL_GIT="$REAL_GIT" FALLBACK_MARKER="$FALLBACK_MARKER" \
-        FAIL_FALLBACK=1 GH_REAPER_PRIORITY_REFS=origin/uncommon \
-        "$REAPER" --json --path "$FAST_ROOT" 2>/dev/null \
-        | jq -r '.[] | select(.branch == "feat-priority") | .status')"
-    if [ "$fast_status" = clean ] && [ ! -e "$FALLBACK_MARKER" ]; then
-        ok "configured remote priority ref bypasses exhaustive fallback"
-    else
-        no "configured remote priority ref bypasses exhaustive fallback" \
-            "status=$fast_status fallback=$([ -e "$FALLBACK_MARKER" ] && echo y || echo n)"
-    fi
+    if command -v jq >/dev/null 2>&1; then
+        check
+        fast_status="$(PATH="$FBIN:$PATH" REAL_GIT="$REAL_GIT" FALLBACK_MARKER="$FALLBACK_MARKER" \
+            FAIL_FALLBACK=1 GH_REAPER_PRIORITY_REFS=origin/uncommon \
+            "$REAPER" --json --path "$FAST_ROOT" 2>/dev/null \
+            | jq -r '.[] | select(.branch == "feat-priority") | .status')"
+        if [ "$fast_status" = clean ] && [ ! -e "$FALLBACK_MARKER" ]; then
+            ok "configured remote priority ref bypasses exhaustive fallback"
+        else
+            no "configured remote priority ref bypasses exhaustive fallback" \
+                "status=$fast_status fallback=$([ -e "$FALLBACK_MARKER" ] && echo y || echo n)"
+        fi
 
-    check
-    rm -f "$FALLBACK_MARKER"
-    fallback_status="$(PATH="$FBIN:$PATH" REAL_GIT="$REAL_GIT" FALLBACK_MARKER="$FALLBACK_MARKER" \
-        GH_REAPER_PRIORITY_REFS=origin/main \
-        "$REAPER" --json --path "$FAST_ROOT" 2>/dev/null \
-        | jq -r '.[] | select(.branch == "feat-priority") | .status')"
-    if [ "$fallback_status" = clean ] && [ -e "$FALLBACK_MARKER" ]; then
-        ok "uncommon remote containment uses bounded fallback"
+        check
+        rm -f "$FALLBACK_MARKER"
+        fallback_status="$(PATH="$FBIN:$PATH" REAL_GIT="$REAL_GIT" FALLBACK_MARKER="$FALLBACK_MARKER" \
+            GH_REAPER_PRIORITY_REFS=origin/main \
+            "$REAPER" --json --path "$FAST_ROOT" 2>/dev/null \
+            | jq -r '.[] | select(.branch == "feat-priority") | .status')"
+        if [ "$fallback_status" = clean ] && [ -e "$FALLBACK_MARKER" ]; then
+            ok "uncommon remote containment uses bounded fallback"
+        else
+            no "uncommon remote containment uses bounded fallback" \
+                "status=$fallback_status fallback=$([ -e "$FALLBACK_MARKER" ] && echo y || echo n)"
+        fi
     else
-        no "uncommon remote containment uses bounded fallback" \
-            "status=$fallback_status fallback=$([ -e "$FALLBACK_MARKER" ] && echo y || echo n)"
+        check; ok "configured priority fast path [jq missing, skipped]"
+        check; ok "bounded containment fallback [jq missing, skipped]"
     fi
     rm -rf "$FBIN"
 
