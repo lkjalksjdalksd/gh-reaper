@@ -7,26 +7,53 @@
 #
 set -uo pipefail
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
-RUN=0; PASS=0; FAIL=0
-
 # Resolve repo root (this script lives in tests/).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REAPER="$ROOT/gh-reaper"
+# shellcheck source=tests/lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
-ok()   { printf "${GREEN}PASS${NC} %s\n" "$1"; PASS=$((PASS+1)); }
-no()   { printf "${RED}FAIL${NC} %s\n  -> %s\n" "$1" "$2"; FAIL=$((FAIL+1)); }
-check(){ RUN=$((RUN+1)); }
-
-# Local git that works offline with file:// remotes.
-g() {
-    command git \
-        -c init.defaultBranch=main \
-        -c user.email=test@example.com -c user.name=test \
-        -c advice.detachedHead=false \
-        -c protocol.file.allow=always "$@"
-}
+# This file is the BASELINE suite: discovery, classification, and reaping
+# behaviour. It is not fence acceptance -- that is tests/fence-pairing.sh, which
+# runs against the real producer and fails when the producer is absent.
+#
+# Every removal now goes through the guard, so this suite cannot reap anything
+# without one configured. It uses an EXPLICIT TEST DOUBLE, and says so: the
+# double implements no ownership-fence logic at all, it just runs the removal
+# argv it is handed. A pass here is never evidence that the fence works.
+#
+# Deliberately not registered in an EXIT trap: this file re-registers EXIT traps
+# per sandbox, and a subshell exiting can fire one early -- which would delete
+# the double out from under the rest of the run. Cleaned up at the end instead.
+FENCE_TMP="$(mk_realpath_tmpdir)"
+FENCE_DOUBLE_PYTHON="$(command -v python3 || echo /usr/bin/true)"
+{
+    printf '#!/bin/sh\n'
+    printf '# EXPLICIT TEST DOUBLE. Implements no ownership-fence logic whatsoever.\n'
+    printf '# Baseline behaviour only; fence acceptance lives in fence-pairing.sh.\n'
+    # The interpreter path is quoted: an unquoted path containing a space would
+    # split into two words and exec the wrong thing.
+    printf 'case "$1" in -c) shift; exec "%s" -c "$@" ;; esac\n' "$FENCE_DOUBLE_PYTHON"
+    printf 'cand=""; kind=""; lref=""; rref=""\n'
+    printf 'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do\n'
+    printf '  case "$1" in\n'
+    printf '    --candidate-path) cand="$2" ;; --removal-path) kind="$2" ;;\n'
+    printf '    --local-ref) lref="$2" ;; --remote-ref) rref="$2" ;;\n'
+    printf '  esac; shift 2 || shift\n'
+    printf 'done\n'
+    printf 'shift\n'
+    printf '"$@" || exit 5\n'
+    # A receipt the consumer actually accepts, removedResources included. A
+    # double emitting a receipt the consumer rejects would leave every reap
+    # reported as failed while the worktree was removed anyway, and this suite
+    # would stay green on path checks alone while success reporting rotted.
+    printf 'printf \x27{"schemaVersion":1,"outcome":"removed","protected":false,"candidatePath":"%%s","localRef":"%%s","remoteRef":"%%s","removalPath":"%%s","postcheck":"absent","groupLiveness":"gone","removedResources":["path"],"custody":"not_applicable"}\\n\x27 "$cand" "$lref" "$rref" "$kind"\n'
+} > "$FENCE_TMP/helper"
+chmod +x "$FENCE_TMP/helper"
+export REAPER_FENCE_HELPER="$FENCE_TMP/helper"
+export REAPER_FENCE_PYTHON="$FENCE_TMP/helper"
+printf 'fence helper for this run: EXPLICIT TEST DOUBLE (fence behaviour NOT covered here)\n\n'
 
 # ---------------------------------------------------------------------------
 # Structural checks
@@ -263,13 +290,31 @@ EOF
     fi
 
     check  # --reap --yes reaps clean + merged, skips dirty + unpushed
-    "$REAPER" --reap --yes --no-color --path "$SBX" >/dev/null 2>&1
+    reap_out="$("$REAPER" --reap --yes --no-color --path "$SBX" 2>&1)"
     if [ ! -d "$SBX/wt-clean" ] && [ ! -d "$SBX/wt-merged" ] \
        && [ -d "$SBX/wt-dirty" ] && [ -d "$SBX/wt-unpushed" ]; then
         ok "--reap --yes reaps clean+merged, skips dirty+unpushed"
     else
         no "--reap --yes reaps clean+merged, skips dirty+unpushed" \
            "clean=$([ -d "$SBX/wt-clean" ]&&echo y||echo n) merged=$([ -d "$SBX/wt-merged" ]&&echo y||echo n) dirty=$([ -d "$SBX/wt-dirty" ]&&echo y||echo n) unpushed=$([ -d "$SBX/wt-unpushed" ]&&echo y||echo n)"
+    fi
+
+    check  # A path that vanished is not the same as a removal this tool owns.
+    # The guard's receipt is what makes a removal reported, so assert the
+    # reporting too -- otherwise a receipt the consumer rejects would leave
+    # every reap printed as "failed" while the checks above still passed.
+    if [ "$(printf '%s' "$reap_out" | grep -c ' reaped ')" -eq 2 ] \
+       && ! printf '%s' "$reap_out" | grep -q ' failed '; then
+        ok "reaped worktrees are reported as reaped, not merely gone"
+    else
+        no "reaped worktrees are reported as reaped, not merely gone" "$reap_out"
+    fi
+
+    check  # and the run's own tally agrees with what it did
+    if printf '%s' "$reap_out" | grep -q 'Reaped 2 worktree(s)'; then
+        ok "the summary counts the removals it reported"
+    else
+        no "the summary counts the removals it reported" "$reap_out"
     fi
 
     check  # --reap --force reaps the risky remainder
@@ -629,12 +674,14 @@ if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
     [ "$n" = 2 ] && ok "locked boolean set on both locked worktrees" \
         || no "locked boolean set on both locked worktrees" "got: $n"
 
-    check  # the headline fix: a stale lock no longer blocks reaping
+    check  # A stale lock is cleared in one guarded `remove --force --force`;
+    # there is no separate unlock step. A lock whose owner is alive reads as
+    # busy and is still spared without --force.
     "$REAPER" --reap --yes --merged --no-color --path "$KSBX" >/dev/null 2>&1
     if [ ! -d "$KSBX/wt-stale" ] && [ -d "$KSBX/wt-live" ]; then
-        ok "reaping lifts a stale lock; a held lock is spared"
+        ok "reaping clears a stale lock atomically; a held lock is spared"
     else
-        no "reaping lifts a stale lock; a held lock is spared" \
+        no "reaping clears a stale lock atomically; a held lock is spared" \
            "wt-stale=$([ -d "$KSBX/wt-stale" ]&&echo y||echo n) wt-live=$([ -d "$KSBX/wt-live" ]&&echo y||echo n)"
     fi
 
@@ -680,13 +727,16 @@ if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
         && ok "honors \$BB_DATA_DIR" \
         || no "honors \$BB_DATA_DIR" "got: $branches"
 
-    check  # reaping clears the empty <env-id> husk but never the root itself
+    check  # PARTIAL: clearing the emptied <env-id> husk is an UNSUPPORTED path.
+    # `rmdir <parent>` is not a pinned git removal, so the guard can neither run
+    # nor adjudicate it. The worktree itself is removed through the guard; the
+    # empty container is now left behind. This is a gap, not compatibility.
     ( cd "$BSBX/elsewhere" && HOME="$BSBX" "$REAPER" --reap --yes --no-color ) >/dev/null 2>&1
-    if [ ! -d "$BSBX/.bb/worktrees/env_aaa" ] && [ -d "$BSBX/.bb/worktrees" ]; then
-        ok "reaping removes the emptied env dir, keeps the scan root"
+    if [ ! -d "$BSBX/.bb/worktrees/env_aaa/repo" ] && [ -d "$BSBX/.bb/worktrees/env_aaa" ]; then
+        ok "the worktree is reaped; its emptied env dir is left (no guarded rmdir)"
     else
-        no "reaping removes the emptied env dir, keeps the scan root" \
-           "env_aaa=$([ -d "$BSBX/.bb/worktrees/env_aaa" ]&&echo y||echo n) root=$([ -d "$BSBX/.bb/worktrees" ]&&echo y||echo n)"
+        no "the worktree is reaped; its emptied env dir is left (no guarded rmdir)" \
+           "repo=$([ -d "$BSBX/.bb/worktrees/env_aaa/repo" ]&&echo y||echo n) env_aaa=$([ -d "$BSBX/.bb/worktrees/env_aaa" ]&&echo y||echo n)"
     fi
 
     check  # a scan root passed explicitly is never rmdir'd out from under you
@@ -703,6 +753,6 @@ if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-echo
-printf "Tests run: %d   ${GREEN}passed: %d${NC}   ${RED}failed: %d${NC}\n" "$RUN" "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+rm -rf "$FENCE_TMP"
+
+summary

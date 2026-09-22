@@ -14,10 +14,6 @@ set -euo pipefail
 VERSION="1.8.0"
 EXTENSION_NAME="gh-reaper"
 
-# Space-delimited, space-padded list of the roots this run scans. Consulted when
-# reaping, to know which directories are containers we own and which are yours.
-SCAN_ROOTS=" "
-
 # Absolute path to this script, so we can re-invoke ourselves as parallel
 # inspection workers (see the --__inspect dispatch at the bottom).
 SELF_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
@@ -114,9 +110,10 @@ OPTIONS:
   -j, --jobs N         Parallel inspection workers (default: CPU count; 1 = serial)
   -a, --all            Scan all of \$HOME (still skips TCC-protected dirs)
   -y, --yes            With --reap, delete without prompting for each worktree
-  -f, --force          With --reap, also remove dirty, unpushed, busy, or
-                       orphaned worktrees
-      --prune          With --reap, run 'git worktree prune' on touched repos afterward
+  -f, --force          With --reap, also remove dirty, unpushed, or busy
+                       worktrees (orphans are refused; see STATUS FLAGS)
+      --prune          Currently skipped: repository-wide pruning has no guarded
+                       per-candidate equivalent (see ENVIRONMENT)
       --json           Emit results as JSON (always read-only)
       --dry-run        List only, change nothing (this is the default; kept for habit)
       --no-color       Disable colored output
@@ -130,9 +127,11 @@ STATUS FLAGS:
   ${C_YELLOW}dirty${C_RESET}      Uncommitted or untracked changes present
   ${C_YELLOW}unpushed${C_RESET}   Commits that exist nowhere on a remote
   ${C_CYAN}busy${C_RESET}       A live process is working in this tree -- leave it alone
-  ${C_DIM}locked${C_RESET}     'git worktree lock' is set; reaping lifts a lock whose
-             owning process is gone (a live owner reads as busy instead)
-  ${C_RED}orphan${C_RESET}     Main repository is gone; only the checkout remains
+  ${C_DIM}locked${C_RESET}     'git worktree lock' is set; a lock whose owning process is
+             gone is cleared as part of the removal itself (a live owner
+             reads as busy instead)
+  ${C_RED}orphan${C_RESET}     Main repository is gone; only the checkout remains -- its
+             identity cannot be proven, so it is refused rather than removed
 
 EXAMPLES:
   # Survey forgotten worktrees -- read-only, the default
@@ -152,6 +151,29 @@ EXAMPLES:
 
   # Machine-wide survey (still skips TCC-protected dirs)
   gh reaper --all
+
+ENVIRONMENT:
+  Both are REQUIRED for any removal, and both must be absolute paths. There is
+  no PATH lookup and no fallback: unset or unusable means nothing is removed,
+  not even with --force.
+
+  REAPER_FENCE_HELPER  Absolute path to the ownership-fence helper script.
+  REAPER_FENCE_PYTHON  Absolute path to the interpreter that runs it.
+
+                       The guarded Git executable is selected from the same
+                       fixed system locations as the helper; PATH is ignored.
+
+                       Every removal is handed to that helper, which holds the
+                       repository's shared lock, checks whether the worktree is
+                       still reserved by an unfinished operation, runs this
+                       tool's own removal command and verifies the result. The
+                       receipt is checked field by field, and the interpreter
+                       must prove it actually ran that check: a zero exit alone
+                       is never treated as success, so an executable that merely
+                       exits successfully is refused rather than believed.
+                       Orphans and --prune have no guarded equivalent and are
+                       refused.
+                       See docs/fence-consumer-api.md.
 
 More cowbell: https://github.com/ai-ecoverse/gh-reaper
 EOF
@@ -711,46 +733,321 @@ inspect_marker() {
 # `busy` instead, which does gate on --force.
 is_risky() { case "$1" in *busy*|*dirty*|*unpushed*|*orphan*) return 0 ;; *) return 1 ;; esac; }
 
-# Removing a worktree can leave its parent directory behind, empty. Harnesses
-# that give every session its own container dir -- bb's
-# <data-dir>/worktrees/<env-id>/<repo>, Conductor's <repo>/.conductor/<name> --
-# would otherwise accumulate one empty husk per tree reaped. Drop the parent
-# only when it is empty *and* is not itself a scan root, so a directory you
-# created on purpose (~/worktrees, ~/Developer) never vanishes under you.
-prune_empty_parent() {
-    local parent; parent="$(dirname "$1")"
-    case "$parent" in /|"$HOME") return 0 ;; esac
-    case "$SCAN_ROOTS" in *" $parent "*) return 0 ;; esac
-    rmdir "$parent" 2>/dev/null || true
+# Removing a worktree can leave its parent container directory behind, empty.
+# Tidying that away is `rmdir <parent>`, which is not a pinned git removal, so
+# the guard can neither run it nor adjudicate it. Rather than mutate a directory
+# outside the guard on a possibly fenced resource, the husk is left in place.
+# See docs/fence-consumer-api.md.
+
+# ---------------------------------------------------------------------------
+# Ownership fence (consumer side)
+# ---------------------------------------------------------------------------
+# Contract: gh-reaper-sweep references/consumer-contract.md v1, mirrored for
+# this side in docs/fence-consumer-api.md.
+#
+# There is exactly ONE entry point, `guard-exec`. It takes the shared
+# retirement lock, evaluates protection, takes durable `remove-prepared`
+# custody, runs OUR removal argv as its own child, postchecks, and closes
+# custody -- all inside that one held lock. We therefore:
+#
+#   * never take or assert that lock ourselves,
+#   * never split the call into verdict/prepare/complete around our own
+#     deletion (that is the deadlock-and-bypass shape the contract forbids),
+#   * never read domain.json, the enrolment witness or reservations from shell
+#     (the helper is authoritative about managedness; `managed` in the receipt
+#     is for logging, not branching),
+#   * and never implement a marker-exists test.
+#
+# gh-reaper remains the remover: guard-exec has no idea how to remove a
+# worktree, it only runs the argv we hand it.
+
+# The helper is two required configured absolute paths, and they are required
+# *unconditionally*. There is no unguarded removal path to fall back to: an
+# unset configuration refuses exactly like an unusable one. "No fence
+# configured" is not evidence that nothing is fenced -- it is an unanswered
+# question, and an unanswered question protects. Configuration absence must
+# never be a way to reach the destructive path.
+#
+#   REAPER_FENCE_HELPER  absolute path to the producer's ownership_fence.py
+#   REAPER_FENCE_PYTHON  absolute path to the interpreter that runs it
+#
+# The contract is explicit that there is no PATH lookup, no discovery and no
+# relative resolution on either: a guard found by searching PATH is a guard an
+# attacker -- or a stale shell -- gets to choose.
+fence_config_missing() {
+    [ -z "${REAPER_FENCE_HELPER:-}" ] || [ -z "${REAPER_FENCE_PYTHON:-}" ]
 }
 
+fence_config_usable() {
+    case "${REAPER_FENCE_PYTHON:-}" in /*) ;; *) return 1 ;; esac
+    case "${REAPER_FENCE_HELPER:-}" in /*) ;; *) return 1 ;; esac
+    [ -f "$REAPER_FENCE_PYTHON" ] && [ -x "$REAPER_FENCE_PYTHON" ] || return 1
+    [ -f "$REAPER_FENCE_HELPER" ] && [ -r "$REAPER_FENCE_HELPER" ]
+}
+
+# "Absolute, regular, executable" does not mean "an interpreter". `/usr/bin/true`
+# is all three: it would accept the guard invocation, run nothing, exit 0, and
+# then accept the receipt check and exit 0 again -- reporting a reap of a
+# worktree that is still there. Exit status alone cannot distinguish a program
+# that agreed from one that merely ended.
+#
+# So the interpreter is asked to prove it ran our code, by handing back a value
+# only this call knows. Anything that cannot is unusable, and unusable protects.
+# This is about ordinary misconfiguration; an attacker who can replace binaries
+# as this user is outside anything the tool can claim.
+fence_interpreter_usable() {
+    local nonce out
+    nonce="reaper-probe-$$-${RANDOM}-${RANDOM}"
+    out="$(REAPER_FENCE_PROBE="$nonce" "$REAPER_FENCE_PYTHON" -c \
+        'import os,sys; sys.stdout.write(os.environ["REAPER_FENCE_PROBE"])' 2>/dev/null)" || return 1
+    [ "$out" = "$nonce" ]
+}
+
+# guard-exec accepts only the producer's pinned Git executable. Resolving Git
+# through PATH can select a shell-local shim or package-manager profile that the
+# producer correctly refuses. Keep this ordered list identical to the producer's
+# retirement policy: Homebrew first where installed, then the system Git.
+fence_pinned_git() {
+    local candidate
+    for candidate in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git; do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Fields are joined with US (0x1f) rather than a tab. Tab is an IFS whitespace
+# character, so `read` would collapse runs of it and shift every later field
+# left the moment a ref is empty -- which is exactly the detached-HEAD and
+# no-upstream case. A non-whitespace separator keeps empty fields empty.
+FENCE_SEP=$'\x1f'
+
+# The compound identity is (candidate path, local ref, remote ref). A named ref
+# must carry the exact version we are about to act on; an unresolvable version
+# stays `absent`, which the helper refuses rather than guesses.
+#
+# `remoteRef` is the candidate's ref *on the origin*, so it is the branch name
+# the remote knows (`refs/heads/x`), not our local remote-tracking mirror
+# (`refs/remotes/origin/x`) -- the helper rejects the latter outright.
+#
+# It is reported *only* when the branch actually tracks `origin`. A branch
+# tracking a backup or fork remote names a different repository, and reporting
+# its ref as the candidate's origin ref would invite the fence to clear a
+# version nobody asked about. Anything that is not literally `origin` reports no
+# remote ref at all, which protects.
+fence_identity() {
+    local wt="$1" lref loid rref roid branch remote
+    lref="$(git -C "$wt" symbolic-ref --quiet HEAD 2>/dev/null)" || lref=""
+    loid=""
+    if [ -n "$lref" ]; then
+        loid="$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null)" || loid=""
+    fi
+    [ -n "$loid" ] || loid="absent"
+
+    rref=""; roid=""
+    if [ -n "$lref" ]; then
+        branch="${lref#refs/heads/}"
+        remote="$(git -C "$wt" config --get "branch.$branch.remote" 2>/dev/null)" || remote=""
+        if [ "$remote" = "origin" ]; then
+            rref="$(git -C "$wt" config --get "branch.$branch.merge" 2>/dev/null)" || rref=""
+            if [ -n "$rref" ]; then
+                roid="$(git -C "$wt" rev-parse --verify --quiet '@{upstream}' 2>/dev/null)" || roid=""
+            fi
+        fi
+    fi
+    [ -n "$roid" ] || roid="absent"
+    printf '%s%s%s%s%s%s%s' "$lref" "$FENCE_SEP" "$loid" "$FENCE_SEP" "$rref" "$FENCE_SEP" "$roid"
+}
+
+# A zero exit is a claim, not a proof. The receipt is the proof, so it is
+# checked field by field against what we actually asked for: a removal of a
+# different candidate, or one whose postcheck never confirmed absence, or one
+# whose descendants are still alive, must never be reported as reaped. An empty,
+# truncated, malformed or mismatched receipt is a failure.
+#
+# Parsing is done by the same pinned interpreter that runs the guard, so there
+# is no second JSON implementation to drift and no PATH-resolved dependency.
+fence_receipt_ok() {
+    local cand="$1" lref="$2" rref="$3" kind="$4" file="$5" nonce out
+    # The verdict has to come back as evidence, not as an exit status: a program
+    # that never ran the check exits 0 just as happily as one that passed it.
+    # Only the validator prints this value, and only after every check holds.
+    nonce="reaper-receipt-$$-${RANDOM}-${RANDOM}"
+    out="$(REAPER_RC_CAND="$cand" REAPER_RC_LREF="$lref" REAPER_RC_RREF="$rref" \
+    REAPER_RC_KIND="$kind" REAPER_RC_NONCE="$nonce" \
+    "$REAPER_FENCE_PYTHON" -c '
+import json, os, sys
+
+raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+lines = [line for line in raw.splitlines() if line.strip()]
+if not lines:
+    sys.exit(1)                       # empty output is not success
+try:
+    receipt = json.loads(lines[-1])   # the receipt is the last line
+except Exception:
+    sys.exit(1)                       # malformed is not success
+if not isinstance(receipt, dict):
+    sys.exit(1)
+
+expected = {
+    "schemaVersion": 1,
+    "outcome": "removed",
+    "protected": False,
+    "candidatePath": os.environ["REAPER_RC_CAND"],
+    "localRef": os.environ["REAPER_RC_LREF"],
+    "remoteRef": os.environ["REAPER_RC_RREF"],
+    "removalPath": os.environ["REAPER_RC_KIND"],
+    "postcheck": "absent",
+    "groupLiveness": "gone",
+}
+for key, want in expected.items():
+    if key not in receipt or receipt[key] != want:
+        sys.exit(1)
+
+# Custody is closed in a fenced domain and simply does not apply in an
+# unenrolled one. "retained" means the guard deliberately kept custody, which is
+# never success.
+if receipt.get("custody") not in ("completed", "not_applicable"):
+    sys.exit(1)
+
+# What the run actually proved absent. Removing a worktree path does not delete
+# its branch, so the guard says so explicitly: "path" is the evidence a worktree
+# removal produces, and it is the evidence this consumer asks for. Anything
+# missing it did not prove the removal we requested.
+removed = receipt.get("removedResources")
+if not isinstance(removed, list) or "path" not in removed:
+    sys.exit(1)
+
+# `argv` is the command as executed, neutralisers included. It is for the log,
+# never an input, so it is deliberately not compared against what was sent.
+#
+# Everything holds, so say so in a way only this program can.
+sys.stdout.write(os.environ["REAPER_RC_NONCE"])
+sys.exit(0)
+' "$file" 2>/dev/null)" || return 1
+    [ "$out" = "$nonce" ]
+}
+
+# One guarded mutation, with stdout (the receipt) and stderr kept apart so the
+# receipt is never polluted by diagnostics.
+fence_guard_exec() {
+    local repo="$1" cand="$2" lref="$3" loid="$4" rref="$5" roid="$6" kind="$7"
+    shift 7
+    "$REAPER_FENCE_PYTHON" "$REAPER_FENCE_HELPER" guard-exec \
+        --repository "$repo" \
+        --candidate-path "$cand" \
+        --local-ref "$lref" \
+        --remote-ref "$rref" \
+        --local-oid "$loid" \
+        --remote-oid "$roid" \
+        --removal-path "$kind" \
+        -- "$@"
+}
+
+# Why a removal was not reported as done. `receipt_unproven` is our own verdict,
+# not the helper's: the helper exited 0 but its receipt did not prove that this
+# exact candidate was removed and verified.
+fence_explain() {
+    case "$1" in
+        receipt_unproven) printf 'receipt did not prove this exact removal; treating as failure' ;;
+        3) printf 'refused: protected by ownership fence' ;;
+        4) printf 'unverified: removal ran but did not verify; custody retained' ;;
+        5) printf 'child_failed: removal command exited non-zero; custody retained' ;;
+        2) printf 'helper error: lock unavailable, bad arguments, or unreadable fence' ;;
+        *) printf 'unrecognised helper exit %s: refusing' "$1" ;;
+    esac
+}
+
+# Every destructive path routes through guard-exec; a path we cannot express as
+# an exactly guarded mutation is disabled, not downgraded.
 reap_one() {
     local wt="$1" main="$2" status="$3"
+
+    if fence_config_missing; then
+        printf 'fence_helper_unconfigured: REAPER_FENCE_HELPER and REAPER_FENCE_PYTHON must both be set; no removal is possible without a guard'
+        return 1
+    fi
+    if ! fence_config_usable; then
+        printf 'fence_helper_unusable: REAPER_FENCE_HELPER/REAPER_FENCE_PYTHON are not usable absolute paths'
+        return 1
+    fi
+    if ! fence_interpreter_usable; then
+        printf 'fence_interpreter_unusable: REAPER_FENCE_PYTHON did not run a trivial program; it is not an interpreter'
+        return 1
+    fi
+
+    local git_bin
+    git_bin="$(fence_pinned_git)" || {
+        printf 'fence_pinned_git_unavailable: no supported system Git executable is installed'
+        return 1
+    }
+
+    # An orphan is removed with `rm -rf`, and guard-exec runs only a pinned git
+    # `worktree remove`/`worktree prune` -- it cannot prove termination for an
+    # arbitrary command, so it refuses one. Its `--repository` is unresolvable
+    # by definition too: an orphan is precisely a checkout whose main repository
+    # is gone, so its identity cannot be proven. Unprovable identity protects.
     if [ "$status" = "orphan" ] || [ -z "$main" ]; then
-        rm -rf "$wt" || return 1
-        prune_empty_parent "$wt"
-        return 0
+        printf 'fence_orphan_unsupported: an orphan has no provable repository identity and no pinned-git removal'
+        return 1
     fi
-    # Lift a stale lock first. `git worktree remove --force` does NOT override a
-    # lock -- git demands 'remove -f -f' -- and we have already judged this tree
-    # reapable, so unlock rather than escalating to double force.
+
+    local cand; cand="$(cd "$wt" 2>/dev/null && pwd -P)" || cand="$wt"
+
+    local lref loid rref roid
+    IFS="$FENCE_SEP" read -r lref loid rref roid <<<"$(fence_identity "$wt")"
+
+    local repo kind rc=0 errfile outfile
+    repo="$(cd "$main" && pwd -P)"
+
+    local args=("$git_bin" -C "$repo" worktree remove)
     case "$status" in
-        *locked*) git -C "$main" worktree unlock "$wt" >/dev/null 2>&1 || true ;;
+        *locked*)
+            # A lock is not lifted separately. `git worktree remove` refuses a
+            # locked worktree and a single --force does not override that --
+            # git wants the second one -- so the whole thing is expressed as one
+            # `remove --force --force`. That keeps it a single guarded mutation
+            # whose postcheck is meaningful, instead of an unguarded
+            # `worktree unlock` followed by a guarded removal, which would leave
+            # the lock lifted if the removal were then refused.
+            #
+            # This does not weaken the busy policy. A lock whose owner is still
+            # alive reads as `busy`, which is risky and still needs --force to
+            # be offered at all; only a lock whose owner is gone reaches here on
+            # its own, and that is exactly the debris this tool exists to clear.
+            args+=(--force --force); kind="lock-lift" ;;
+        *)
+            if is_risky "$status" || [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+                args+=(--force); kind="force"
+            else
+                kind="normal"
+            fi ;;
     esac
-    local args=(worktree remove)
-    # Risky statuses force by classification. A worktree we already judged
-    # reapable (clean/merged) can still carry ignored lock-file churn or an agent
-    # session file that plain `git worktree remove` refuses ("contains modified
-    # or untracked files") -- force past that too, the decision to reap is made.
-    if is_risky "$status" || [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
-        args+=(--force)
+    args+=("$cand")
+
+    outfile="$(mktemp)"; errfile="$(mktemp)"
+    fence_guard_exec "$repo" "$cand" "$lref" "$loid" "$rref" "$roid" \
+        "$kind" "${args[@]}" >"$outfile" 2>"$errfile" || rc=$?
+
+    # A zero exit alone is not success: the receipt has to prove that this exact
+    # candidate was removed, verified absent, with no surviving descendants.
+    local status="reaped"
+    if [ "$rc" -ne 0 ]; then
+        status="$rc"
+    elif ! fence_receipt_ok "$cand" "$lref" "$rref" "$kind" "$outfile"; then
+        status="receipt_unproven"
     fi
-    args+=("$wt")
-    local out rc=0
-    out="$(git -C "$main" "${args[@]}" 2>&1)" || rc=$?
-    [ "$rc" -eq 0 ] && prune_empty_parent "$wt"
-    printf '%s' "$out"
-    return "$rc"
+
+    cat "$outfile"; cat "$errfile" >&2
+    rm -f "$outfile" "$errfile"
+
+    if [ "$status" != "reaped" ]; then
+        printf '\n  %s' "$(fence_explain "$status")"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -769,7 +1066,6 @@ main() {
     # ---- discover ----
     local roots=(); local root
     while IFS= read -r root; do roots+=("$root"); done < <(resolve_roots)
-    for root in "${roots[@]:-}"; do [ -n "$root" ] && SCAN_ROOTS="$SCAN_ROOTS$root "; done
     if [ ${#roots[@]} -eq 0 ]; then
         echo "No scannable directories found. Pass a PATH or use --all." >&2
         exit 1
@@ -896,7 +1192,6 @@ main() {
 
     # ---- reap ----
     local reap_all="$opt_yes" reaped=0 freed_kb=0 ans out
-    local touched_mains=()
     for rec in "${sorted[@]}"; do
         IFS=$'\t' read -r touched kb branch status path main <<<"$rec"
 
@@ -923,20 +1218,18 @@ main() {
             printf '%s reaped%s %s\n' "$C_GREEN" "$C_RESET" "$(tilde "$path")"
             reaped=$(( reaped + 1 ))
             freed_kb=$(( freed_kb + kb ))
-            [ -n "$main" ] && touched_mains+=("$main")
         else
             printf '%s failed%s %s\n  %s%s%s\n' \
                 "$C_RED" "$C_RESET" "$(tilde "$path")" "$C_DIM" "$out" "$C_RESET"
         fi
     done
 
-    if [ "$opt_prune" = 1 ] && [ ${#touched_mains[@]} -gt 0 ]; then
-        local m seen=" "
-        for m in "${touched_mains[@]}"; do
-            case "$seen" in *" $m "*) continue ;; esac
-            seen="$seen$m "
-            git -C "$m" worktree prune 2>/dev/null || true
-        done
+    # `git worktree prune` is repository-wide: it has no single candidate path,
+    # so the guard -- which is scoped to one candidate and postchecks that exact
+    # path -- cannot express it. It is skipped rather than run outside the guard.
+    if [ "$opt_prune" = 1 ]; then
+        printf '%snote: --prune skipped: repository-wide pruning has no guarded per-candidate equivalent.%s\n' \
+            "$C_DIM" "$C_RESET"
     fi
 
     printf '\n%sReaped %d worktree(s), reclaimed %s.%s\n' \
