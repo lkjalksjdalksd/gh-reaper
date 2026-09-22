@@ -891,10 +891,16 @@ except Exception:
 if not isinstance(receipt, dict):
     sys.exit(1)
 
+# JSON booleans compare equal to Python integers, so value equality alone would
+# accept `true` as schema version 1 and numeric zero as `protected: false`.
+# These protocol fields require their exact JSON types as well as their values.
+if type(receipt.get("schemaVersion")) is not int or receipt["schemaVersion"] != 1:
+    sys.exit(1)
+if type(receipt.get("protected")) is not bool or receipt["protected"] is not False:
+    sys.exit(1)
+
 expected = {
-    "schemaVersion": 1,
     "outcome": "removed",
-    "protected": False,
     "candidatePath": os.environ["REAPER_RC_CAND"],
     "localRef": os.environ["REAPER_RC_LREF"],
     "remoteRef": os.environ["REAPER_RC_RREF"],
@@ -917,7 +923,14 @@ if receipt.get("custody") not in ("completed", "not_applicable"):
 # removal produces, and it is the evidence this consumer asks for. Anything
 # missing it did not prove the removal we requested.
 removed = receipt.get("removedResources")
-if not isinstance(removed, list) or "path" not in removed:
+allowed_removed = {"path", "local"}
+if (
+    not isinstance(removed, list)
+    or any(type(item) is not str for item in removed)
+    or removed.count("path") != 1
+    or len(removed) != len(set(removed))
+    or not set(removed).issubset(allowed_removed)
+):
     sys.exit(1)
 
 # `argv` is the command as executed, neutralisers included. It is for the log,

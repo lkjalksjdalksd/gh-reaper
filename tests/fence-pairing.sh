@@ -1175,12 +1175,12 @@ receipt_case() {
     fi
 }
 
-R_OK='{"schemaVersion":1,"outcome":"removed","protected":false,"candidatePath":"@CAND@","localRef":"refs/heads/feat-clean","remoteRef":"refs/heads/feat-clean","removalPath":"force"'
+R_OK='{"schemaVersion":1,"outcome":"removed","protected":false,"candidatePath":"@CAND@","localRef":"refs/heads/feat-clean","remoteRef":"refs/heads/feat-clean","removalPath":"normal"'
 
 receipt_case "exit 0 with an empty receipt is not success" "$TMPROOT/s1" 'exit 0'
 receipt_case "exit 0 with a malformed receipt is not success" "$TMPROOT/s2" 'echo not json; exit 0'
 receipt_case "a receipt naming a different candidate is not success" "$TMPROOT/s3" \
-  'echo {\"schemaVersion\":1,\"outcome\":\"removed\",\"protected\":false,\"candidatePath\":\"/somewhere/else\",\"localRef\":\"refs/heads/feat-clean\",\"remoteRef\":\"refs/heads/feat-clean\",\"removalPath\":\"force\",\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"custody\":\"completed\"}; exit 0'
+  'echo {\"schemaVersion\":1,\"outcome\":\"removed\",\"protected\":false,\"candidatePath\":\"/somewhere/else\",\"localRef\":\"refs/heads/feat-clean\",\"remoteRef\":\"refs/heads/feat-clean\",\"removalPath\":\"normal\",\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\"],\"custody\":\"completed\"}; exit 0'
 receipt_case "a receipt whose postcheck is not absent is not success" "$TMPROOT/s4" \
   "echo '$R_OK,\"postcheck\":\"present\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\"],\"custody\":\"completed\"}'; exit 0"
 receipt_case "a receipt with surviving descendants is not success" "$TMPROOT/s5" \
@@ -1192,7 +1192,17 @@ receipt_case "a receipt with no removedResources is not success" "$TMPROOT/s8" \
 receipt_case "a receipt proving no path removal is not success" "$TMPROOT/s9" \
   "echo '$R_OK,\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"local\"],\"custody\":\"completed\"}'; exit 0"
 receipt_case "a receipt with the wrong schema version is not success" "$TMPROOT/s7" \
-  "echo '{\"schemaVersion\":2,\"outcome\":\"removed\",\"protected\":false,\"candidatePath\":\"@CAND@\",\"localRef\":\"refs/heads/feat-clean\",\"remoteRef\":\"refs/heads/feat-clean\",\"removalPath\":\"force\",\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"custody\":\"completed\"}'; exit 0"
+  "echo '{\"schemaVersion\":2,\"outcome\":\"removed\",\"protected\":false,\"candidatePath\":\"@CAND@\",\"localRef\":\"refs/heads/feat-clean\",\"remoteRef\":\"refs/heads/feat-clean\",\"removalPath\":\"normal\",\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\"],\"custody\":\"completed\"}'; exit 0"
+receipt_case "a boolean schema version is not integer version 1" "$TMPROOT/s10" \
+  "echo '{\"schemaVersion\":true,\"outcome\":\"removed\",\"protected\":false,\"candidatePath\":\"@CAND@\",\"localRef\":\"refs/heads/feat-clean\",\"remoteRef\":\"refs/heads/feat-clean\",\"removalPath\":\"normal\",\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\"],\"custody\":\"completed\"}'; exit 0"
+receipt_case "numeric zero is not boolean false protection" "$TMPROOT/s11" \
+  "echo '{\"schemaVersion\":1,\"outcome\":\"removed\",\"protected\":0,\"candidatePath\":\"@CAND@\",\"localRef\":\"refs/heads/feat-clean\",\"remoteRef\":\"refs/heads/feat-clean\",\"removalPath\":\"normal\",\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\"],\"custody\":\"completed\"}'; exit 0"
+receipt_case "remote ref removal cannot be claimed for a worktree reap" "$TMPROOT/s12" \
+  "echo '$R_OK,\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\",\"remote\"],\"custody\":\"completed\"}'; exit 0"
+receipt_case "unknown removed resource is not proof" "$TMPROOT/s13" \
+  "echo '$R_OK,\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\",\"mystery\"],\"custody\":\"completed\"}'; exit 0"
+receipt_case "duplicate removed resources are not exact proof" "$TMPROOT/s14" \
+  "echo '$R_OK,\"postcheck\":\"absent\",\"groupLiveness\":\"gone\",\"removedResources\":[\"path\",\"path\"],\"custody\":\"completed\"}'; exit 0"
 
 check  # Paths are not always tidy. A sandbox with spaces and shell
 # metacharacters proves nothing here splits a word it should have quoted.

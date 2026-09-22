@@ -104,15 +104,16 @@ stderr so diagnostics cannot pollute it — and requires **all** of:
 
 | Field | Required value |
 | --- | --- |
-| `schemaVersion` | `1` |
+| `schemaVersion` | JSON integer `1` |
 | `outcome` | `removed` |
-| `protected` | `false` |
+| `protected` | JSON boolean `false` |
 | `candidatePath` | exactly the candidate we asked to remove |
 | `localRef` / `remoteRef` | exactly the refs we sent |
 | `removalPath` | exactly the path we declared |
 | `postcheck` | `absent` |
 | `groupLiveness` | `gone` |
 | `custody` | `completed`, or `not_applicable` in an unenrolled domain |
+| `removedResources` | exactly one `path`, optionally one `local`; never `remote`, duplicates, or unknown values |
 
 An empty, truncated, malformed or mismatched receipt is a failure, and
 `custody: retained` — the guard deliberately keeping custody — is never success.
